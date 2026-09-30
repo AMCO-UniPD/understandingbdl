@@ -1,9 +1,7 @@
 import torch
 
-from ..utils import flatten, set_weights
 from .subspaces import Subspace
 from ._assess_dimension import _infer_dimension_
-
 
 class SWAG(torch.nn.Module):
 
@@ -12,7 +10,10 @@ class SWAG(torch.nn.Module):
         super(SWAG, self).__init__()
 
         self.base_model = base(*args, **kwargs)
-        self.num_parameters = sum(param.numel() for param in self.base_model.parameters())
+        # Complex parameters are represented by concatenated real and imaginary
+        # parts in the SWAG statistics and subspace.
+        self.num_parameters = sum(param.numel() * (2 if param.is_complex() else 1)
+                                  for param in self.base_model.parameters())
 
         self.register_buffer('mean', torch.zeros(self.num_parameters))
         self.register_buffer('sq_mean', torch.zeros(self.num_parameters))
@@ -28,17 +29,44 @@ class SWAG(torch.nn.Module):
 
         self.cov_factor = None
         self.model_device = 'cpu'
-        
+
     # dont put subspace on cuda?
     def cuda(self, device=None):
-        self.model_device = 'cuda'
-        self.base_model.cuda(device=device)
+        self.to(torch.device('cuda' if device is None else device))
+        return self
 
     def to(self, *args, **kwargs):
         self.base_model.to(*args, **kwargs)
-        device, dtype, non_blocking = torch._C._nn._parse_to(*args, **kwargs)
-        self.model_device = device.type
-        self.subspace.to(device=torch.device('cpu'), dtype=dtype, non_blocking=non_blocking)
+        device, _, _ = torch._C._nn._parse_to(*args, **kwargs)
+        if device is None:
+            device = next(self.base_model.parameters(), self.mean).device
+        self.model_device = torch.device(device).type
+        if self.subspace is not None:
+            # Subspace storage remains on CPU; SWAG vectors are assembled there.
+            self.subspace.to(device=torch.device('cpu'))
+        return self
+
+    @staticmethod
+    def _flatten_parameter(param):
+        value = param.detach().cpu().reshape(-1)
+        if param.is_complex():
+            return torch.cat((value.real, value.imag))
+        return value
+
+    def _assign_vector(self, vector):
+        offset = 0
+        with torch.no_grad():
+            for param in self.base_model.parameters():
+                count = param.numel()
+                if param.is_complex():
+                    real = vector[offset:offset + count].reshape(param.shape)
+                    offset += count
+                    imag = vector[offset:offset + count].reshape(param.shape)
+                    offset += count
+                    param.copy_(torch.complex(real, imag).to(param.device))
+                else:
+                    param.copy_(vector[offset:offset + count].reshape(param.shape).to(param.device))
+                    offset += count
 
     def forward(self, *args, **kwargs):
         return self.base_model(*args, **kwargs)
@@ -47,7 +75,7 @@ class SWAG(torch.nn.Module):
         # need to refit the space after collecting a new model
         self.cov_factor = None
 
-        w = flatten([param.detach().cpu() for param in base_model.parameters()])
+        w = torch.cat([self._flatten_parameter(param) for param in base_model.parameters()])
         # first moment
         self.mean.mul_(self.n_models.item() / (self.n_models.item() + 1.0))
         self.mean.add_(w / (self.n_models.item() + 1.0))
@@ -58,7 +86,8 @@ class SWAG(torch.nn.Module):
 
         dev_vector = w - self.mean
 
-        self.subspace.collect_vector(dev_vector, *args, **kwargs)
+        if self.subspace is not None:
+            self.subspace.collect_vector(dev_vector, *args, **kwargs)
         self.n_models.add_(1)
 
     def _get_mean_and_variance(self):
@@ -71,7 +100,7 @@ class SWAG(torch.nn.Module):
         self.cov_factor = self.subspace.get_space()
 
     def set_swa(self):
-        set_weights(self.base_model, self.mean, self.model_device)
+        self._assign_vector(self.mean)
 
     def sample(self, scale=0.5, diag_noise=True):
         self.fit()
@@ -85,8 +114,28 @@ class SWAG(torch.nn.Module):
         sample = mean + z
 
         # apply to parameters
-        set_weights(self.base_model, sample, self.model_device)
+        self._assign_vector(sample)
         return sample
+
+    def sample_and_assign(self, scale=0.5, use_subspace=True):
+        """Draw a diagonal/low-rank SWAG sample and assign it to the model."""
+        device = next(self.base_model.parameters(), self.mean).device
+        mean = self.mean.to(device)
+        variance = torch.clamp(self.sq_mean.to(device) - mean ** 2,
+                               min=self.var_clamp)
+        sampled = mean + scale * variance.sqrt() * torch.randn_like(mean)
+        if use_subspace and self.subspace is not None and hasattr(self.subspace, 'cov_mat_sqrt'):
+            cov_factor = self.subspace.cov_mat_sqrt.to(device)
+            rank = cov_factor.shape[0]
+            if rank > 0 and cov_factor.shape[1] == sampled.numel():
+                sampled = sampled + scale * (cov_factor.t() @ torch.randn(
+                    rank, device=device, dtype=cov_factor.dtype)) / max(rank - 1, 1) ** 0.5
+        self._assign_vector(sampled)
+        return sampled
+
+    def restore_mean(self):
+        """Restore the model parameters to the accumulated SWAG mean."""
+        self._assign_vector(self.mean)
 
     def get_space(self, export_cov_factor=True):
         mean, variance = self._get_mean_and_variance()
