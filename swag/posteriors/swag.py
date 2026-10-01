@@ -9,6 +9,7 @@ class SWAG(torch.nn.Module):
                  subspace_kwargs=None, var_clamp=1e-6, *args, **kwargs):
         super(SWAG, self).__init__()
 
+        # Forward architecture-specific arguments (including model_config) to base.
         self.base_model = base(*args, **kwargs)
         # Complex parameters are represented by concatenated real and imaginary
         # parts in the SWAG statistics and subspace.
@@ -32,15 +33,21 @@ class SWAG(torch.nn.Module):
 
     # dont put subspace on cuda?
     def cuda(self, device=None):
-        self.to(torch.device('cuda' if device is None else device))
+        self.base_model.cuda(device=device)
+        self.model_device = 'cuda'
         return self
+
+    def cpu(self):
+        return self.to('cpu')
 
     def to(self, *args, **kwargs):
         self.base_model.to(*args, **kwargs)
-        device, _, _ = torch._C._nn._parse_to(*args, **kwargs)
-        if device is None:
-            device = next(self.base_model.parameters(), self.mean).device
-        self.model_device = torch.device(device).type
+        # Use the resulting model device instead of PyTorch's private _parse_to
+        # API, whose return signature differs across versions. All .to overloads
+        # are handled by the base model; posterior statistics remain on CPU.
+        device = next(self.base_model.parameters(),
+                      next(self.base_model.buffers(), self.mean)).device
+        self.model_device = device.type
         if self.subspace is not None:
             # Subspace storage remains on CPU; SWAG vectors are assembled there.
             self.subspace.to(device=torch.device('cpu'))

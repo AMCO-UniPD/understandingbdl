@@ -11,7 +11,6 @@ import torch
 import numpy as np
 
 from sklearn.decomposition import TruncatedSVD
-from sklearn.decomposition.pca import _assess_dimension_
 from sklearn.utils.extmath import randomized_svd
 
 
@@ -133,6 +132,18 @@ class PCASpace(CovarianceSpace):
 
         # perform post-selection fitting
         if self.pca_rank == 'mle':
+            # Only the optional MLE rank selection needs this private API.
+            # Recent scikit-learn versions renamed both the module and function.
+            try:
+                from sklearn.decomposition._pca import _assess_dimension
+
+                def _assess_dimension_(spectrum, rank, n_features, n_samples):
+                    if rank == 0:
+                        return -np.inf
+                    return _assess_dimension(spectrum, rank, n_samples)
+            except ImportError:
+                from sklearn.decomposition.pca import _assess_dimension_
+
             eigs = s ** 2.0
             ll = np.zeros(len(eigs))
             correction = np.zeros(len(eigs))
